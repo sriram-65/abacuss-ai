@@ -1,0 +1,5 @@
+{
+  "name": "Abscuss - Abacus Training Platform",
+  "description": "A comprehensive Abacus training platform with an admin panel for question management and a student quiz interface with performance analytics.",
+  "requestFramePermissions": []
+}
