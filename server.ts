@@ -1,33 +1,28 @@
 import express from 'express';
-import { createServer as createViteServer } from 'vite';
 import jwt from 'jsonwebtoken';
 import mongoose from 'mongoose';
-import path from 'path';
-import { fileURLToPath } from 'url';
 import dotenv from 'dotenv';
 
 dotenv.config();
 
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
+const app = express();
+app.use(express.json());
 
 const MONGODB_URI = process.env.MONGODB_URI;
 const JWT_SECRET = process.env.JWT_SECRET || 'super-secret-abscuss-key';
 
-// MongoDB Connection
-if (!MONGODB_URI) {
-  console.error('❌ MONGODB_URI is not defined in environment variables.');
-  console.error('Please set MONGODB_URI in the Secrets panel in AI Studio.');
-} else {
-  mongoose.connect(MONGODB_URI)
-    .then(() => console.log('✅ Connected to MongoDB Atlas'))
-    .catch(err => {
-      console.error('❌ MongoDB connection error:', err.message);
-      if (err.message.includes('ECONNREFUSED')) {
-        console.error('It seems like the application is trying to connect to a local MongoDB instance.');
-        console.error('Make sure your MONGODB_URI is a valid Atlas connection string.');
-      }
-    });
+// MongoDB Connection (will be called on each function invocation)
+let cached = (global as any).mongoose || { conn: null, promise: null };
+
+async function connectDB() {
+  if (cached.conn) return cached.conn;
+  
+  if (!cached.promise) {
+    cached.promise = mongoose.connect(MONGODB_URI!).then((mongoose) => mongoose);
+  }
+  
+  cached.conn = await cached.promise;
+  return cached.conn;
 }
 
 // Schemas
@@ -81,60 +76,69 @@ resultSchema.set('toJSON', {
   transform: function (doc, ret) { delete ret._id; }
 });
 
-const User = mongoose.model('User', userSchema);
-const Question = mongoose.model('Question', questionSchema);
-const Result = mongoose.model('Result', resultSchema);
+const User = mongoose.models.User || mongoose.model('User', userSchema);
+const Question = mongoose.models.Question || mongoose.model('Question', questionSchema);
+const Result = mongoose.models.Result || mongoose.model('Result', resultSchema);
 
-async function startServer() {
-  const app = express();
-  app.use(express.json());
-
-  // Auth Middleware
-  const authenticate = (req: any, res: any, next: any) => {
-    const token = req.headers.authorization?.split(' ')[1];
-    if (!token) return res.status(401).json({ error: 'Unauthorized' });
-    try {
-      const decoded = jwt.verify(token, JWT_SECRET);
-      req.user = decoded;
-      next();
-    } catch (err) {
-      res.status(401).json({ error: 'Invalid token' });
-    }
-  };
-
-  const isAdmin = (req: any, res: any, next: any) => {
-    if (req.user.role !== 'admin') return res.status(403).json({ error: 'Forbidden' });
+// Auth Middleware
+const authenticate = async (req: any, res: any, next: any) => {
+  const token = req.headers.authorization?.split(' ')[1];
+  if (!token) return res.status(401).json({ error: 'Unauthorized' });
+  try {
+    const decoded = jwt.verify(token, JWT_SECRET);
+    req.user = decoded;
     next();
-  };
+  } catch (err) {
+    res.status(401).json({ error: 'Invalid token' });
+  }
+};
 
-  // Auth Routes
-  app.post('/api/auth/register', async (req, res) => {
+const isAdmin = (req: any, res: any, next: any) => {
+  if (req.user.role !== 'admin') return res.status(403).json({ error: 'Forbidden' });
+  next();
+};
+
+// Auth Routes
+app.post('/api/auth/register', async (req, res) => {
+  try {
+    await connectDB();
     const { username, password, role } = req.body;
-    try {
-      const user = new User({ username, password, role: role || 'student' });
-      await user.save();
-      res.json({ id: user.id });
-    } catch (err) {
-      res.status(400).json({ error: 'Username already exists' });
-    }
-  });
+    const user = new User({ username, password, role: role || 'student' });
+    await user.save();
+    res.json({ id: user.id });
+  } catch (err) {
+    res.status(400).json({ error: 'Username already exists' });
+  }
+});
 
-  app.post('/api/auth/login', async (req, res) => {
+app.post('/api/auth/login', async (req, res) => {
+  try {
+    await connectDB();
     const { username, password } = req.body;
     const user = await User.findOne({ username, password });
     if (!user) return res.status(401).json({ error: 'Invalid credentials' });
     
     const token = jwt.sign({ id: user.id, username: user.username, role: user.role }, JWT_SECRET);
     res.json({ token, user: { id: user.id, username: user.username, role: user.role } });
-  });
+  } catch (err) {
+    res.status(500).json({ error: 'Server error' });
+  }
+});
 
-  // Question Routes
-  app.get('/api/questions', authenticate, async (req, res) => {
+// Question Routes
+app.get('/api/questions', authenticate, async (req, res) => {
+  try {
+    await connectDB();
     const questions = await Question.find().sort({ createdAt: -1 });
     res.json(questions);
-  });
+  } catch (err) {
+    res.status(500).json({ error: 'Server error' });
+  }
+});
 
-  app.post('/api/questions', authenticate, isAdmin, async (req, res) => {
+app.post('/api/questions', authenticate, isAdmin, async (req, res) => {
+  try {
+    await connectDB();
     const { title, digits, columns, allowNegative, count = 10 } = req.body;
     
     const problems = [];
@@ -167,15 +171,25 @@ async function startServer() {
     });
     await questionSet.save();
     res.json(questionSet);
-  });
+  } catch (err) {
+    res.status(500).json({ error: 'Server error' });
+  }
+});
 
-  app.delete('/api/questions/:id', authenticate, isAdmin, async (req, res) => {
+app.delete('/api/questions/:id', authenticate, isAdmin, async (req, res) => {
+  try {
+    await connectDB();
     await Question.findByIdAndDelete(req.params.id);
     res.json({ success: true });
-  });
+  } catch (err) {
+    res.status(500).json({ error: 'Server error' });
+  }
+});
 
-  // Result Routes
-  app.post('/api/results', authenticate, async (req: any, res) => {
+// Result Routes
+app.post('/api/results', authenticate, async (req: any, res) => {
+  try {
+    await connectDB();
     const { total_questions, correct_answers, accuracy, total_time, details } = req.body;
     const result = new Result({
       user_id: req.user.id,
@@ -187,28 +201,20 @@ async function startServer() {
     });
     await result.save();
     res.json(result);
-  });
+  } catch (err) {
+    res.status(500).json({ error: 'Server error' });
+  }
+});
 
-  app.get('/api/results/me', authenticate, async (req: any, res) => {
+app.get('/api/results/me', authenticate, async (req: any, res) => {
+  try {
+    await connectDB();
     const results = await Result.find({ user_id: req.user.id }).sort({ createdAt: -1 });
     res.json(results);
-  });
-
-  // Vite middleware for development
-  if (process.env.NODE_ENV !== 'production') {
-    const vite = await createViteServer({
-      server: { middlewareMode: true },
-      appType: 'spa',
-    });
-    app.use(vite.middlewares);
-  } else {
-    app.use(express.static('dist'));
-    app.get('*', (req, res) => res.sendFile(path.join(__dirname, 'dist/index.html')));
+  } catch (err) {
+    res.status(500).json({ error: 'Server error' });
   }
+});
 
-  app.listen(3000, '0.0.0.0', () => {
-    console.log('Server running on http://localhost:3000');
-  });
-}
-
-startServer();
+// Export for Vercel
+export default app;
